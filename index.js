@@ -4,65 +4,101 @@ const crypto = require('crypto');
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 
-// ── FIREBASE INIT ──
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const app = express();
+app.use('/webhook/nowpayments', express.raw({ type: 'application/json' }));
+app.use(express.json());
 
-// ── TELEGRAM HELPER ──
+const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
+const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
 async function sendTelegram(message) {
   try {
-    await fetch(
-      `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: process.env.TELEGRAM_CHAT_ID,
-          text: message,
-          parse_mode: 'HTML',
-        }),
-      }
-    );
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: 'HTML',
+      }),
+    });
   } catch (err) {
     console.error('[Telegram] Failed:', err.message);
   }
 }
-
-// ── VERIFY NOWPAYMENTS SIGNATURE ──
-function verifySignature(rawBody, signature) {
-  const hmac = crypto.createHmac('sha512', process.env.NOWPAYMENTS_IPN_SECRET);
-  hmac.update(rawBody);
-  const digest = hmac.digest('hex');
-  return digest === signature;
-}
-
-// ── RAW BODY NEEDED FOR SIGNATURE CHECK ──
-app.use('/webhook/nowpayments', express.raw({ type: 'application/json' }));
-app.use(express.json());
 
 // ── KEEP ALIVE ──
 app.get('/', (req, res) => {
   res.send('Cyrus NowPayments Webhook Running ✅');
 });
 
-// ── MAIN WEBHOOK ──
+// ── CREATE PAYMENT ──
+app.post('/create-payment', async (req, res) => {
+  try {
+    const { amount, uid, email } = req.body;
+    if (!amount || !uid) {
+      return res.status(400).json({ error: 'Missing amount or uid' });
+    }
+
+    const response = await fetch('https://api.nowpayments.io/v1/payment', {
+      method: 'POST',
+      headers: {
+        'x-api-key': NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        price_amount: amount,
+        price_currency: 'usd',
+        pay_currency: 'usdttrc20',
+        order_id: uid,
+        order_description: `Cyrus Capital Deposit - ${email || uid}`,
+        ipn_callback_url: `https://cyrus-nowpayments-webhook-production.up.railway.app/webhook/nowpayments`,
+      }),
+    });
+
+    const data = await response.json();
+    console.log('[CreatePayment] Response:', JSON.stringify(data));
+
+    if (data.payment_id) {
+      // Save to Firestore
+      await db.collection('depositProofs').add({
+        uid: uid,
+        userEmail: email || '',
+        paymentId: String(data.payment_id),
+        amount: amount,
+        status: 'pending',
+        payAddress: data.pay_address,
+        payCurrency: data.pay_currency,
+        payAmount: data.pay_amount,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return res.json({
+        success: true,
+        payment_id: data.payment_id,
+        pay_address: data.pay_address,
+        pay_amount: data.pay_amount,
+        pay_currency: data.pay_currency,
+      });
+    } else {
+      return res.status(500).json({ error: data.message || 'Payment creation failed' });
+    }
+  } catch (err) {
+    console.error('[CreatePayment] Error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── WEBHOOK ──
 app.post('/webhook/nowpayments', async (req, res) => {
   try {
-    const signature = req.headers['x-nowpayments-sig'];
     const rawBody = req.body;
-
-    // Verify signature
-    // Signature check disabled for testing
-// if (!verifySignature(rawBody, signature)) {
-//     console.log('[Webhook] Invalid signature, ignoring.');
-//     return res.status(400).send('Invalid signature');
-// }
-
     const data = JSON.parse(rawBody.toString());
     console.log('[Webhook] Received:', JSON.stringify(data));
 
@@ -70,75 +106,52 @@ app.post('/webhook/nowpayments', async (req, res) => {
     const status = data.payment_status || '';
     const amountPaid = parseFloat(data.actually_paid || data.pay_amount || 0);
     const currency = data.pay_currency || '';
+    const orderUid = data.order_id || '';
 
-    // Only process confirmed/finished payments
     if (status !== 'finished' && status !== 'confirmed') {
       console.log(`[Webhook] Status is "${status}", not ready yet.`);
       return res.status(200).send('OK - not ready');
     }
 
-    if (!paymentId) {
-      console.log('[Webhook] No payment_id found.');
-      return res.status(200).send('OK - no payment id');
-    }
+    if (!paymentId) return res.status(200).send('OK - no payment id');
 
-    // ── CHECK IF ALREADY PROCESSED ──
-    const alreadyDone = await db
-      .collection('processed_nowpayments')
-      .doc(paymentId)
-      .get();
+    // Check already processed
+    const alreadyDone = await db.collection('processed_nowpayments').doc(paymentId).get();
+    if (alreadyDone.exists) return res.status(200).send('OK - already done');
 
-    if (alreadyDone.exists) {
-      console.log(`[Webhook] Payment ${paymentId} already processed.`);
-      return res.status(200).send('OK - already done');
-    }
-
-    // ── FIND MATCHING DEPOSIT PROOF ──
-    const proofSnap = await db
-      .collection('depositProofs')
+    // Find deposit proof
+    const proofSnap = await db.collection('depositProofs')
       .where('paymentId', '==', paymentId)
       .where('status', '==', 'pending')
       .limit(1)
       .get();
 
-    if (proofSnap.empty) {
-      console.log(`[Webhook] No pending depositProof found for ID: ${paymentId}`);
-      await sendTelegram(
-        `⚠️ <b>NowPayments - No Match Found</b>\n` +
-        `🆔 Payment ID: ${paymentId}\n` +
-        `💰 Amount: ${amountPaid} ${currency}\n` +
-        `📊 Status: ${status}\n\n` +
-        `User may not have submitted proof yet. Check manually.`
-      );
-      return res.status(200).send('OK - no match');
+    let userUid = orderUid;
+    let creditAmount = amountPaid;
+
+    if (!proofSnap.empty) {
+      const proofData = proofSnap.docs[0].data();
+      userUid = proofData.uid || orderUid;
+      creditAmount = proofData.amount || amountPaid;
+
+      await proofSnap.docs[0].ref.update({
+        status: 'approved',
+        approvedAt: admin.firestore.Timestamp.now(),
+        approvedBy: 'auto_nowpayments_webhook',
+        actuallyPaid: amountPaid,
+      });
     }
 
-    const proofDoc = proofSnap.docs[0];
-    const proofData = proofDoc.data();
-    const userUid = proofData.uid;
-    const creditAmount = proofData.amount || amountPaid;
+    if (!userUid) return res.status(200).send('OK - no user found');
 
-    // ── CREDIT USER & UPDATE STATUS ──
-    const batch = db.batch();
-
-    // Update depositProof status
-    batch.update(proofDoc.ref, {
-      status: 'approved',
-      approvedAt: admin.firestore.Timestamp.now(),
-      approvedBy: 'auto_nowpayments_webhook',
-      actuallyPaid: amountPaid,
-      payCurrency: currency,
-    });
-
-    // Credit user balance
+    // Credit user
     const userRef = db.collection('users').doc(userUid);
-    batch.update(userRef, {
+    await userRef.update({
       balance: admin.firestore.FieldValue.increment(creditAmount),
     });
 
-    // Create transaction record
-    const txRef = db.collection('transactions').doc();
-    batch.set(txRef, {
+    // Add transaction
+    await db.collection('transactions').add({
       uid: userUid,
       type: 'Deposit',
       amount: creditAmount,
@@ -153,38 +166,19 @@ app.post('/webhook/nowpayments', async (req, res) => {
       },
     });
 
-    // Also update the transaction in 'transactions' that user created when submitting proof
-    const existingTxSnap = await db
-      .collection('transactions')
-      .where('uid', '==', userUid)
-      .where('metadata.paymentId', '==', paymentId)
-      .limit(1)
-      .get();
-
-    if (!existingTxSnap.empty) {
-      batch.update(existingTxSnap.docs[0].ref, {
-        status: 'approved',
-        approvedAt: admin.firestore.Timestamp.now(),
-      });
-    }
-
-    await batch.commit();
-
-    // ── MARK AS PROCESSED ──
+    // Mark processed
     await db.collection('processed_nowpayments').doc(paymentId).set({
       processedAt: admin.firestore.Timestamp.now(),
       userUid: userUid,
       amount: creditAmount,
-      currency: currency,
     });
 
-    // ── GET USER INFO FOR TELEGRAM ──
     const userSnap = await userRef.get();
     const userData = userSnap.data() || {};
 
     await sendTelegram(
       `✅ <b>NowPayments Auto-Approved!</b>\n` +
-      `👤 User: ${userData.firstName || 'Unknown'} ${userData.lastName || ''}\n` +
+      `👤 User: ${userData.firstName || 'Unknown'}\n` +
       `📧 Email: ${userData.email || userUid}\n` +
       `💰 Credited: $${creditAmount}\n` +
       `🪙 Paid: ${amountPaid} ${currency}\n` +
@@ -192,17 +186,15 @@ app.post('/webhook/nowpayments', async (req, res) => {
       `⏰ Time: ${new Date().toLocaleString()}`
     );
 
-    console.log(`[Webhook] ✅ Auto-credited $${creditAmount} to user ${userUid}`);
+    console.log(`[Webhook] ✅ Auto-credited $${creditAmount} to ${userUid}`);
     return res.status(200).send('OK - credited');
 
   } catch (err) {
     console.error('[Webhook] Error:', err.message);
-    await sendTelegram(`❌ <b>NowPayments Webhook Error</b>\n⚠️ ${err.message}`);
     return res.status(500).send('Error');
   }
 });
 
-// ── START SERVER ──
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[Cyrus] NowPayments webhook server running on port ${PORT}`);
