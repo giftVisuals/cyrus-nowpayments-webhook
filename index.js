@@ -64,7 +64,7 @@ app.post('/create-payment', async (req, res) => {
       body: JSON.stringify({
         price_amount: amount,
         price_currency: 'usd',
-        pay_currency: 'trx',
+        pay_currency: 'sol',
         order_id: uid,
         order_description: `Cyrus Capital Deposit - ${email || uid}`,
         ipn_callback_url: `https://cyrus-nowpayments-webhook-production.up.railway.app/webhook/nowpayments`,
