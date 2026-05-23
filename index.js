@@ -50,7 +50,7 @@ app.get('/', (req, res) => {
 // ── CREATE PAYMENT ──
 app.post('/create-payment', async (req, res) => {
   try {
-    const { amount, uid, email } = req.body;
+    const { amount, uid, email, pay_currency } = req.body;
     if (!amount || !uid) {
       return res.status(400).json({ error: 'Missing amount or uid' });
     }
